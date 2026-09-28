@@ -10,7 +10,6 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
-#include <linux/pm_clock.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <sound/soc.h>
@@ -276,6 +275,46 @@ struct va_macro {
 };
 
 #define to_va_macro(_hw) container_of(_hw, struct va_macro, hw)
+
+static void va_macro_disable_clocks(struct va_macro *va)
+{
+	clk_disable_unprepare(va->npl);
+	clk_disable_unprepare(va->mclk);
+	clk_disable_unprepare(va->dcodec);
+	clk_disable_unprepare(va->macro);
+}
+
+static int va_macro_enable_clocks(struct va_macro *va)
+{
+	int ret;
+
+	ret = clk_prepare_enable(va->macro);
+	if (ret)
+		return ret;
+
+	ret = clk_prepare_enable(va->dcodec);
+	if (ret)
+		goto err_dcodec;
+
+	ret = clk_prepare_enable(va->mclk);
+	if (ret)
+		goto err_mclk;
+
+	ret = clk_prepare_enable(va->npl);
+	if (ret)
+		goto err_npl;
+
+	return 0;
+
+err_npl:
+	clk_disable_unprepare(va->mclk);
+err_mclk:
+	clk_disable_unprepare(va->dcodec);
+err_dcodec:
+	clk_disable_unprepare(va->macro);
+
+	return ret;
+}
 
 struct va_macro_data {
 	bool has_swr_master;
@@ -1602,21 +1641,6 @@ static void fsgen_gate_disable(struct clk_hw *hw)
 	pm_runtime_put_autosuspend(va->dev);
 }
 
-static int va_macro_setup_pm_clocks(struct device *dev, struct va_macro *va)
-{
-	int ret;
-
-	ret = devm_pm_clk_create(dev);
-	if (ret)
-		return ret;
-
-	ret = of_pm_clk_add_clks(dev);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-
 static int fsgen_gate_is_enabled(struct clk_hw *hw)
 {
 	struct va_macro *va = to_va_macro(hw);
@@ -1830,10 +1854,6 @@ static int va_macro_probe(struct platform_device *pdev)
 			goto err;
 	}
 
-	ret = va_macro_setup_pm_clocks(dev, va);
-	if (ret)
-		goto err_rpm_disable;
-
 	pm_runtime_set_autosuspend_delay(dev, 3000);
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_enable(dev);
@@ -1921,9 +1941,10 @@ static int va_macro_runtime_suspend(struct device *dev)
 	struct va_macro *va = dev_get_drvdata(dev);
 
 	regcache_cache_only(va->regmap, true);
+	va_macro_disable_clocks(va);
 	regcache_mark_dirty(va->regmap);
 
-	return pm_clk_suspend(dev);
+	return 0;
 }
 
 static int va_macro_runtime_resume(struct device *dev)
@@ -1931,20 +1952,27 @@ static int va_macro_runtime_resume(struct device *dev)
 	struct va_macro *va = dev_get_drvdata(dev);
 	int ret;
 
-	ret = pm_clk_resume(dev);
+	ret = va_macro_enable_clocks(va);
 	if (ret)
 		return ret;
 
 
 	regcache_cache_only(va->regmap, false);
 
-	return regcache_sync(va->regmap);
+	ret = regcache_sync(va->regmap);
+	if (ret) {
+		regcache_cache_only(va->regmap, true);
+		regcache_mark_dirty(va->regmap);
+		va_macro_disable_clocks(va);
+		return ret;
+	}
+
+	return 0;
 }
 
 
-static const struct dev_pm_ops va_macro_pm_ops = {
-	RUNTIME_PM_OPS(va_macro_runtime_suspend, va_macro_runtime_resume, NULL)
-};
+static DEFINE_RUNTIME_DEV_PM_OPS(va_macro_pm_ops, va_macro_runtime_suspend,
+				 va_macro_runtime_resume, NULL);
 
 static const struct of_device_id va_macro_dt_match[] = {
 	{ .compatible = "qcom,sc7280-lpass-va-macro", .data = &sc7280_va_data },
